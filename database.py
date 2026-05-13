@@ -53,26 +53,54 @@ def get_stats():
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM animals WHERE type = 'Кот'")
-    cats = cursor.fetchone()[0]
+    # Summary counts
+    cursor.execute("SELECT type, COUNT(*) FROM animals GROUP BY type")
+    type_counts = cursor.fetchall()
 
-    cursor.execute("SELECT COUNT(*) FROM animals WHERE type = 'Собака'")
-    dogs = cursor.fetchone()[0]
+    # Color counts
+    cursor.execute("SELECT color, COUNT(*) FROM animals GROUP BY color")
+    color_counts = cursor.fetchall()
 
+    # Total occupied
     cursor.execute("SELECT COUNT(*) FROM animals")
     occupied = cursor.fetchone()[0]
 
-    total_cells = 100 # A1-J10
-    free_cells = total_cells - occupied
+    # Recent additions
+    cursor.execute("SELECT col, row, type, name FROM animals ORDER BY added_at DESC LIMIT 5")
+    recent = cursor.fetchall()
 
     conn.close()
 
-    return (
-        f"📊 **Статистика склада:**\n"
-        f"🐈 Котов: {cats}\n"
-        f"🐕 Собак: {dogs}\n"
-        f"📦 Свободных ячеек: {free_cells}/100"
-    )
+    total_cells = 100 # A1-J10
+    free_cells = total_cells - occupied
+    occupancy_pct = (occupied / total_cells) * 100
+
+    lines = ["📊 **ПОДРОБНАЯ СТАТИСТИКА СКЛАДА**", ""]
+
+    lines.append("📈 **Заполненность:**")
+    lines.append(f"└ Занято: {occupied}/{total_cells} ({occupancy_pct:.1f}%)")
+    lines.append(f"└ Свободно: {free_cells}")
+    lines.append("")
+
+    lines.append("🐾 **По видам:**")
+    for atype, count in type_counts:
+        icon = "🐈" if atype == "Кот" else "🐕" if atype == "Собака" else "❓"
+        lines.append(f"└ {icon} {atype}: {count}")
+    lines.append("")
+
+    lines.append("🎨 **По цветам:**")
+    for color, count in color_counts:
+        color_val = color if color else "Неизвестно"
+        lines.append(f"└ {color_val}: {count}")
+    lines.append("")
+
+    if recent:
+        lines.append("🆕 **Последние поступления:**")
+        for col, row, atype, name in recent:
+            name_val = name if name else "Без имени"
+            lines.append(f"└ {col}{row}: {atype} {name_val}")
+
+    return "\n".join(lines)
 
 def get_user_tasks(user_id):
     conn = get_connection()
@@ -148,9 +176,12 @@ def add_animals(animals_list, user_id):
 
         # Check for missing fields
         missing = []
-        if not name or name.lower() == "неизвестно": missing.append("кличку")
-        if not color or color.lower() == "неизвестно": missing.append("цвет")
-        if not age or age == "Неизвестно": missing.append("возраст")
+        if not name or (isinstance(name, str) and name.strip().lower() == "неизвестно"):
+            missing.append("кличку")
+        if not color or (isinstance(color, str) and color.strip().lower() == "неизвестно"):
+            missing.append("цвет")
+        if not age or (isinstance(age, str) and age.strip().lower() == "неизвестно"):
+            missing.append("возраст")
 
         if missing:
             cursor.execute("INSERT INTO tasks (animal_id, user_id, missing_fields) VALUES (?, ?, ?)",
@@ -234,9 +265,12 @@ def find_and_modify(intent, user_id, action):
             cursor.execute("SELECT name, color, age FROM animals WHERE id = ?", (animal_id,))
             a = cursor.fetchone()
             missing = []
-            if not a[0] or (isinstance(a[0], str) and a[0].lower() == "неизвестно"): missing.append("кличку")
-            if not a[1] or (isinstance(a[1], str) and a[1].lower() == "неизвестно"): missing.append("цвет")
-            if not a[2] or str(a[2]).lower() == "неизвестно": missing.append("возраст")
+            if not a[0] or (isinstance(a[0], str) and a[0].strip().lower() == "неизвестно"):
+                missing.append("кличку")
+            if not a[1] or (isinstance(a[1], str) and a[1].strip().lower() == "неизвестно"):
+                missing.append("цвет")
+            if not a[2] or (isinstance(a[2], str) and a[2].strip().lower() == "неизвестно"):
+                missing.append("возраст")
 
             if missing:
                 cursor.execute("INSERT INTO tasks (animal_id, user_id, missing_fields) VALUES (?, ?, ?)",

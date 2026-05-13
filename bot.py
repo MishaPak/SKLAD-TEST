@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8690167473:AAFiacl5M1yVEsoROFLg-xAvUwby2mjBP6A")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Load Whisper model once
 WHISPER_MODEL = whisper.load_model("small")
@@ -33,6 +33,7 @@ def ask_llama(text: str, db_context: str = "") -> dict:
     3. Для записи данных используй action: 'add' (поступление), 'remove' (списание), 'update' (изменение).
     4. Тип животного должен быть в именительном падеже, ед. числе, с заглавной буквы. ВСЕ клички и цвета пиши СТРОГО КИРИЛЛИЦЕЙ.
     5. Формат ответа: {{"action":"...", "response":"...", "target_cell":"A1", "target_name":"...", "animals":[{{"type":"Кот", "name":"...", "color":"...", "age":"...", "legs": 4, "ears": 2, "eyes": 2}}]}}
+    6. Если кличка, цвет или возраст неизвестны, СТРОГО пиши 'Неизвестно'.
     """
     try:
         r = requests.post("http://localhost:11434/api/generate", json={
@@ -56,6 +57,7 @@ def ask_llava(img_path: str, caption: str) -> str:
             "1. Подпись пользователя — ГЛАВНЫЙ источник для КЛИЧКИ и ВОЗРАСТА. Если в тексте есть имя или возраст, используй их.\n"
             "2. Фото — источник для ВИДА (Кот или Собака) и ЦВЕТА.\n"
             "3. Если в подписи нет имени, пиши 'Кличка: Неизвестно'.\n"
+        "4. Если возраст или цвет невозможно определить, пиши 'Неизвестно'.\n"
             "Верни СТРОГО в таком формате: Вид: ..., Кличка: ..., Цвет: ..., Возраст: ..."
         )
 
