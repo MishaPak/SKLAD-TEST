@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = "8690167473:AAFiacl5M1yVEsoROFLg-xAvUwby2mjBP6A"
 
 # Load Whisper model once
 WHISPER_MODEL = whisper.load_model("small")

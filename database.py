@@ -206,9 +206,17 @@ def find_and_modify(intent, user_id, action):
 
     # Try to find the animal
     if target_cell:
-        col = target_cell[0].upper()
-        row = int(target_cell[1:])
-        cursor.execute("SELECT id, type, name FROM animals WHERE col = ? AND row = ?", (col, row))
+        try:
+            if len(target_cell) < 2:
+                raise ValueError("Invalid cell format")
+            col = target_cell[0].upper()
+            row = int(target_cell[1:])
+            if col not in "ABCDEFGHIJ" or not (1 <= row <= 10):
+                raise ValueError("Cell out of range")
+            cursor.execute("SELECT id, type, name FROM animals WHERE col = ? AND row = ?", (col, row))
+        except (ValueError, IndexError):
+            conn.close()
+            return f"Ошибка: некорректный формат ячейки '{target_cell}'. Используйте A1-J10."
     elif target_name:
         cursor.execute("SELECT id, type, name FROM animals WHERE name LIKE ?", (f"%{target_name}%",))
     else:
