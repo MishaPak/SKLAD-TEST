@@ -1,151 +1,251 @@
-import os
-import json
-import base64
-import requests
-import subprocess
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import database
+import sqlite3
+from datetime import datetime
 
-TOKEN = "8690167473:AAFiacl5M1yVEsoROFLg-xAvUwby2mjBP6A"
+DB_PATH = "sklad.db"
 
-def ask_llama(text: str, db_context: str = "") -> dict:
-    system = f"""Ты — ИИ-кладовщик Ефим. Твоя задача: управлять складом или отвечать на вопросы по базе.
-    ТЕКУЩЕЕ СОСТОЯНИЕ БАЗЫ ДАННЫХ:
-    {db_context}
-    
-    ПРАВИЛА:
-    1. Мы учитываем ТОЛЬКО два вида: "Кот" и "Собака". Любых других игнорируй.
-    2. Если пользователь задает ВОПРОС о животных на складе (кто где сидит, есть ли свободные клетки, где рыжие коты и т.д.), выбери action: 'answer' и напиши понятный ответ в поле 'response'.
-    3. Для записи данных используй action: 'add' (поступление), 'remove' (списание), 'update' (изменение).
-    4. Тип животного должен быть в именительном падеже, ед. числе, с заглавной буквы. ВСЕ клички и цвета пиши СТРОГО КИРИЛЛИЦЕЙ.
-    5. Формат ответа: {{"action":"...", "response":"...", "target_cell":"A1", "target_name":"...", "animals":[{{"type":"Кот", "name":"...", "color":"...", "age":"...", "legs": 4, "ears": 2, "eyes": 2}}]}}
-    """
-    try:
-        r = requests.post("http://localhost:11434/api/generate", json={
-            "model": "llama3:8b", "system": system, "prompt": text, "format": "json", "stream": False
-        }, timeout=120)
-        return json.loads(r.json().get("response", "{}"))
-    except Exception as e:
-        print(f"Ошибка Llama: {e}")
-        return {}
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    _init_db(conn)
+    return conn
 
-def ask_llava(img_path: str, caption: str) -> str:
-    with open(img_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-    
-    # Жесткий промпт для вытаскивания только нужной информации
-    prompt = (
-        f"Ты — аналитик склада. Твоя задача объединить данные с фото и текстовой подписи: '{caption}'.\n"
-        "ПРАВИЛА:\n"
-        "1. Подпись пользователя — ГЛАВНЫЙ источник для КЛИЧКИ и ВОЗРАСТА. Если в тексте есть имя или возраст, используй их.\n"
-        "2. Фото — источник для ВИДА (Кот или Собака) и ЦВЕТА.\n"
-        "3. Если в подписи нет имени, пиши 'Кличка: Неизвестно'.\n"
-        "Верни СТРОГО в таком формате: Вид: ..., Кличка: ..., Цвет: ..., Возраст: ..."
+def _init_db(conn):
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS animals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT, name TEXT, color TEXT, age INTEGER,
+            legs INTEGER DEFAULT 4, ears INTEGER DEFAULT 2, eyes INTEGER DEFAULT 2,
+            row INTEGER, col TEXT, added_at TEXT, user_id INTEGER)
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            animal_id INTEGER, user_id INTEGER, missing_fields TEXT)
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS archive (
+            id INTEGER, type TEXT, name TEXT, color TEXT, age INTEGER,
+            legs INTEGER, ears INTEGER, eyes INTEGER,
+            row INTEGER, col TEXT, added_at TEXT, removed_at TEXT)
+    """)
+    conn.commit()
+
+def get_inventory_brief():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT col, row, type, name, color FROM animals")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return "Склад пуст."
+
+    brief = []
+    for r in rows:
+        col, row, atype, name, color = r
+        name = name if name else "Без имени"
+        color = color if color else "неизвестного цвета"
+        brief.append(f"{col}{row}: {atype} {name} ({color})")
+
+    return "\n".join(brief)
+
+def get_stats():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM animals WHERE type = 'Кот'")
+    cats = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM animals WHERE type = 'Собака'")
+    dogs = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM animals")
+    occupied = cursor.fetchone()[0]
+
+    total_cells = 100 # A1-J10
+    free_cells = total_cells - occupied
+
+    conn.close()
+
+    return (
+        f"📊 **Статистика склада:**\n"
+        f"🐈 Котов: {cats}\n"
+        f"🐕 Собак: {dogs}\n"
+        f"📦 Свободных ячеек: {free_cells}/100"
     )
-    
-    r = requests.post("http://localhost:11434/api/generate", json={
-        "model": "llava:7b", "prompt": prompt, "images": [b64], "stream": False
-    }, timeout=120)
-    return r.json().get("response", "").strip()
 
-def transcribe_voice(path: str) -> str:
-    import whisper
-    wav = path.replace(".ogg", ".wav")
-    subprocess.run(["ffmpeg", "-y", "-i", path, wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    model = whisper.load_model("small")
-    res = model.transcribe(wav, language="ru")
-    os.remove(wav)
-    return res["text"]
+def get_user_tasks(user_id):
+    conn = get_connection()
+    cursor = conn.cursor()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kbd = [['📊 Статистика склада', '📋 Задачи']]
-    resume = (
-        "🤖 **Ефим — ИИ-Кладовщик**\n\n"
-        "Я ваш цифровой помощник по учету животных на складе (ячейки A1-J10).\n\n"
-        "**Что я умею:**\n"
-        "✅ Вести журнал поступлений и списаний (принимаю текст, аудио и фото).\n"
-        "✅ Отвечать на вопросы по складу (Спросите: «Кто в клетке B2?», «Сколько свободных мест?», «Где белые коты?»).\n"
-        "✅ Отслеживать незаполненные карточки животных (кнопка «Задачи»).\n\n"
-        "**Мои ограничения:**\n"
-        "⚠️ Учитываю ТОЛЬКО Котов и Собак. Остальных (коров, лошадей и т.д.) игнорирую.\n"
-        "⚠️ Не списываю животных, если их карточка заполнена не до конца.\n"
-        "⚠️ Все клички и цвета фиксирую строго на кириллице."
-    )
-    await update.message.reply_text(resume, reply_markup=ReplyKeyboardMarkup(kbd, resize_keyboard=True), parse_mode="Markdown")
+    cursor.execute("""
+        SELECT a.col, a.row, a.type, t.missing_fields
+        FROM tasks t
+        JOIN animals a ON t.animal_id = a.id
+        WHERE t.user_id = ?
+    """, (user_id,))
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    text = update.message.text
-    ltext = text.lower()
+    rows = cursor.fetchall()
+    conn.close()
 
-    if any(word in ltext for word in ["задач", "задани", "📋"]):
-        await update.message.reply_text(database.get_user_tasks(uid))
-        return
-    if any(word in ltext for word in ["статистик", "статус", "сводк", "📊"]):
-        await update.message.reply_text(database.get_stats())
-        return
+    if not rows:
+        return "✅ У вас нет невыполненных задач. Все карточки животных заполнены!"
 
-    # Получаем срез базы для ответа на вопросы
-    db_context = database.get_inventory_brief()
-    intent = ask_llama(text, db_context)
-    act = intent.get("action")
-    
-    if act == "answer":
-        res = intent.get("response", "К сожалению, я не нашел ответа в базе.")
-    elif act == "add": 
-        res = database.add_animals(intent.get("animals", []), uid)
-    elif act == "remove": 
-        res = database.find_and_modify(intent, uid, "remove")
-    elif act == "update": 
-        res = database.find_and_modify(intent, uid, "update")
-    else: 
-        res = "Команда не распознана или не требует действий с базой."
+    tasks = ["📋 **Ваши задачи (заполните пропуски):**"]
+    for r in rows:
+        col, row, atype, missing = r
+        tasks.append(f"📍 Ячейка {col}{row} ({atype}): нужно уточнить {missing}")
 
-    await update.message.reply_text(res)
+    return "\n".join(tasks)
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    wait = await update.message.reply_text("⏳ Изучаю данные...")
-    
-    if update.message.voice:
-        f = await update.message.voice.get_file()
-        p = "v.ogg"
-        await f.download_to_drive(p)
-        txt = transcribe_voice(p)
-        os.remove(p)
-        await update.message.reply_text(f"🎤 Распознано: {txt}")
+def _get_free_cell(cursor, preferred=None):
+    if preferred:
+        col = preferred[0].upper()
+        row = int(preferred[1:])
+        cursor.execute("SELECT 1 FROM animals WHERE col = ? AND row = ?", (col, row))
+        if not cursor.fetchone():
+            return col, row
+
+    for r in range(1, 11):
+        for c in "ABCDEFGHIJ":
+            cursor.execute("SELECT 1 FROM animals WHERE col = ? AND row = ?", (c, r))
+            if not cursor.fetchone():
+                return c, r
+    return None, None
+
+def add_animals(animals_list, user_id):
+    if not animals_list:
+        return "Нечего добавлять."
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    added_count = 0
+    for animal in animals_list:
+        atype = animal.get("type")
+        if atype not in ["Кот", "Собака"]:
+            continue
+
+        col, row = _get_free_cell(cursor)
+        if not col:
+            conn.close()
+            return "Ошибка: на складе нет свободных мест!"
+
+        name = animal.get("name")
+        color = animal.get("color")
+        age = animal.get("age")
+        legs = animal.get("legs", 4)
+        ears = animal.get("ears", 2)
+        eyes = animal.get("eyes", 2)
+        added_at = datetime.now().isoformat()
+
+        cursor.execute("""
+            INSERT INTO animals (type, name, color, age, legs, ears, eyes, row, col, added_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (atype, name, color, age, legs, ears, eyes, row, col, added_at, user_id))
+
+        animal_id = cursor.lastrowid
+
+        # Check for missing fields
+        missing = []
+        if not name or name.lower() == "неизвестно": missing.append("кличку")
+        if not color or color.lower() == "неизвестно": missing.append("цвет")
+        if not age or age == "Неизвестно": missing.append("возраст")
+
+        if missing:
+            cursor.execute("INSERT INTO tasks (animal_id, user_id, missing_fields) VALUES (?, ?, ?)",
+                           (animal_id, user_id, ", ".join(missing)))
+
+        added_count += 1
+
+    conn.commit()
+    conn.close()
+
+    if added_count > 0:
+        return f"✅ Успешно добавлено животных: {added_count}."
     else:
-        f = await update.message.photo[-1].get_file()
-        p = f"photos/{f.file_id}.jpg"
-        os.makedirs("photos", exist_ok=True)
-        await f.download_to_drive(p)
-        txt = f"На фото: {ask_llava(p, update.message.caption or 'поступление')}"
+        return "Ни одного подходящего животного (Кот/Собака) не найдено."
 
-    # Для медиа тоже можно передать контекст базы
-    db_context = database.get_inventory_brief()
-    intent = ask_llama(txt, db_context)
-    act = intent.get("action")
-    
-    if act == "answer":
-        res = intent.get("response", "К сожалению, я не нашел ответа.")
-    elif act == "add": 
-        res = database.add_animals(intent.get("animals", []), uid)
-    elif act == "remove": 
-        res = database.find_and_modify(intent, uid, "remove")
-    elif act == "update": 
-        res = database.find_and_modify(intent, uid, "update")
+def find_and_modify(intent, user_id, action):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    target_cell = intent.get("target_cell")
+    target_name = intent.get("target_name")
+
+    # Try to find the animal
+    if target_cell:
+        col = target_cell[0].upper()
+        row = int(target_cell[1:])
+        cursor.execute("SELECT id, type, name FROM animals WHERE col = ? AND row = ?", (col, row))
+    elif target_name:
+        cursor.execute("SELECT id, type, name FROM animals WHERE name LIKE ?", (f"%{target_name}%",))
     else:
-        res = database.add_animals(intent.get("animals", []), uid) # По умолчанию для фото
+        conn.close()
+        return "Не удалось определить животное для действия."
 
-    await wait.edit_text(res)
+    found = cursor.fetchone()
+    if not found:
+        conn.close()
+        return "Животное не найдено в указанном месте или по имени."
 
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.VOICE | filters.PHOTO, handle_media))
-    app.run_polling()
+    animal_id, atype, name = found
 
-if __name__ == "__main__":
-    main()
+    if action == "remove":
+        # Check if animal has tasks
+        cursor.execute("SELECT 1 FROM tasks WHERE animal_id = ?", (animal_id,))
+        if cursor.fetchone():
+            conn.close()
+            return f"⚠️ Нельзя списать {atype} {name}, так как его карточка заполнена не полностью! Проверьте список задач."
+
+        # Move to archive
+        cursor.execute("SELECT * FROM animals WHERE id = ?", (animal_id,))
+        a = cursor.fetchone()
+        # id, type, name, color, age, legs, ears, eyes, row, col, added_at, user_id
+        cursor.execute("""
+            INSERT INTO archive (id, type, name, color, age, legs, ears, eyes, row, col, added_at, removed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], datetime.now().isoformat()))
+
+        cursor.execute("DELETE FROM animals WHERE id = ?", (animal_id,))
+        res = f"✅ {atype} {name} успешно списан со склада."
+
+    elif action == "update":
+        animals = intent.get("animals", [])
+        if not animals:
+            conn.close()
+            return "Нет данных для обновления."
+
+        updates = animals[0]
+        # Only update what's provided
+        fields = []
+        params = []
+        for key in ["type", "name", "color", "age", "legs", "ears", "eyes"]:
+            if key in updates:
+                fields.append(f"{key} = ?")
+                params.append(updates[key])
+
+        if fields:
+            params.append(animal_id)
+            cursor.execute(f"UPDATE animals SET {', '.join(fields)} WHERE id = ?", params)
+
+            # Re-check tasks
+            cursor.execute("DELETE FROM tasks WHERE animal_id = ?", (animal_id,))
+            cursor.execute("SELECT name, color, age FROM animals WHERE id = ?", (animal_id,))
+            a = cursor.fetchone()
+            missing = []
+            if not a[0] or (isinstance(a[0], str) and a[0].lower() == "неизвестно"): missing.append("кличку")
+            if not a[1] or (isinstance(a[1], str) and a[1].lower() == "неизвестно"): missing.append("цвет")
+            if not a[2] or str(a[2]).lower() == "неизвестно": missing.append("возраст")
+
+            if missing:
+                cursor.execute("INSERT INTO tasks (animal_id, user_id, missing_fields) VALUES (?, ?, ?)",
+                               (animal_id, user_id, ", ".join(missing)))
+
+            res = f"✅ Данные {atype} обновлены."
+        else:
+            res = "Изменений не зафиксировано."
+
+    conn.commit()
+    conn.close()
+    return res
